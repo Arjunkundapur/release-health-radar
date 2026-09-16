@@ -1,6 +1,8 @@
 import { StatusBar } from 'expo-status-bar';
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
+  ActivityIndicator,
+  Linking,
   Platform,
   Pressable,
   SafeAreaView,
@@ -13,7 +15,7 @@ import type { DimensionValue } from 'react-native';
 
 type PlatformName = 'iOS' | 'Android';
 type ReleaseStatus = 'healthy' | 'watch' | 'pause';
-type TabKey = 'health' | 'anomalies' | 'pipeline';
+type TabKey = 'health' | 'anomalies' | 'pipeline' | 'oss';
 
 type Release = {
   id: string;
@@ -29,6 +31,51 @@ type Release = {
   duplicateEvents: number;
   lateEvents: number;
 };
+
+type GitHubRepository = {
+  stargazers_count: number;
+  forks_count: number;
+  open_issues_count: number;
+  pushed_at: string;
+  html_url: string;
+};
+
+type GitHubWorkflowRun = {
+  id: number;
+  name: string;
+  status: string;
+  conclusion: string | null;
+  head_branch: string;
+  created_at: string;
+  updated_at: string;
+  html_url: string;
+};
+
+type GitHubCommit = {
+  sha: string;
+  html_url: string;
+  author: { login: string } | null;
+  commit: {
+    message: string;
+    author: { name: string; date: string };
+  };
+};
+
+type ExpoOssData = {
+  repository: GitHubRepository;
+  workflowRuns: GitHubWorkflowRun[];
+  commits: GitHubCommit[];
+  fetchedAt: string;
+};
+
+type ExpoOssState = {
+  data: ExpoOssData | null;
+  loading: boolean;
+  error: string | null;
+};
+
+const EXPO_REPOSITORY_URL = 'https://github.com/expo/expo';
+const GITHUB_API_ROOT = 'https://api.github.com/repos/expo/expo';
 
 const releases: Release[] = [
   {
@@ -93,7 +140,72 @@ const tabs: Array<{ key: TabKey; label: string }> = [
   { key: 'health', label: 'Health' },
   { key: 'anomalies', label: 'Anomalies' },
   { key: 'pipeline', label: 'Pipeline' },
+  { key: 'oss', label: 'Expo OSS' },
 ];
+
+function useExpoOssData(refreshKey: number, enabled: boolean): ExpoOssState {
+  const [state, setState] = useState<ExpoOssState>({ data: null, loading: true, error: null });
+
+  useEffect(() => {
+    if (!enabled) return;
+
+    let active = true;
+
+    async function load() {
+      setState((current) => ({ ...current, loading: true, error: null }));
+
+      try {
+        const [repositoryResponse, workflowsResponse, commitsResponse] = await Promise.all([
+          fetch(GITHUB_API_ROOT, { headers: { Accept: 'application/vnd.github+json' } }),
+          fetch(`${GITHUB_API_ROOT}/actions/runs?per_page=30`, {
+            headers: { Accept: 'application/vnd.github+json' },
+          }),
+          fetch(`${GITHUB_API_ROOT}/commits?per_page=8`, {
+            headers: { Accept: 'application/vnd.github+json' },
+          }),
+        ]);
+
+        if (!repositoryResponse.ok || !workflowsResponse.ok || !commitsResponse.ok) {
+          throw new Error('GitHub API request failed or reached its public rate limit.');
+        }
+
+        const [repository, workflows, commits] = await Promise.all([
+          repositoryResponse.json() as Promise<GitHubRepository>,
+          workflowsResponse.json() as Promise<{ workflow_runs: GitHubWorkflowRun[] }>,
+          commitsResponse.json() as Promise<GitHubCommit[]>,
+        ]);
+
+        if (active) {
+          setState({
+            data: {
+              repository,
+              workflowRuns: workflows.workflow_runs,
+              commits,
+              fetchedAt: new Date().toISOString(),
+            },
+            loading: false,
+            error: null,
+          });
+        }
+      } catch (error) {
+        if (active) {
+          setState((current) => ({
+            ...current,
+            loading: false,
+            error: error instanceof Error ? error.message : 'Unable to load expo/expo data.',
+          }));
+        }
+      }
+    }
+
+    load();
+    return () => {
+      active = false;
+    };
+  }, [enabled, refreshKey]);
+
+  return state;
+}
 
 function crashRate(release: Release) {
   return release.crashes / release.sessions;
@@ -150,6 +262,29 @@ function formatNumber(value: number) {
   return new Intl.NumberFormat('en-US').format(value);
 }
 
+function formatCompactNumber(value: number) {
+  return new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 }).format(value);
+}
+
+function formatRelativeTime(value: string) {
+  const elapsedMinutes = Math.max(0, Math.round((Date.now() - new Date(value).getTime()) / 60000));
+  if (elapsedMinutes < 1) return 'just now';
+  if (elapsedMinutes < 60) return `${elapsedMinutes}m ago`;
+  const elapsedHours = Math.round(elapsedMinutes / 60);
+  if (elapsedHours < 24) return `${elapsedHours}h ago`;
+  return `${Math.round(elapsedHours / 24)}d ago`;
+}
+
+function formatDuration(start: string, end: string) {
+  const seconds = Math.max(0, Math.round((new Date(end).getTime() - new Date(start).getTime()) / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  return `${Math.round(seconds / 60)}m`;
+}
+
+function openExternalUrl(url: string) {
+  Linking.openURL(url).catch(() => undefined);
+}
+
 function statusColor(status: ReleaseStatus) {
   if (status === 'pause') return '#d04437';
   if (status === 'watch') return '#b7791f';
@@ -158,6 +293,9 @@ function statusColor(status: ReleaseStatus) {
 
 export default function App() {
   const [selectedTab, setSelectedTab] = useState<TabKey>('health');
+  const [ossRefreshKey, setOssRefreshKey] = useState(0);
+  const expoOssState = useExpoOssData(ossRefreshKey, selectedTab === 'oss');
+  const showingLiveData = selectedTab === 'oss';
   const selectedRelease = useMemo(
     () => releases.find((release) => releaseStatus(release) === 'pause') ?? releases[0],
     [],
@@ -180,21 +318,25 @@ export default function App() {
             <Text style={styles.eyebrow}>Expo release observability</Text>
             <Text style={styles.title}>Release Health Radar</Text>
           </View>
-          <View style={styles.livePill}>
-            <View style={styles.liveDot} />
-            <Text style={styles.liveText}>Live demo</Text>
+          <View style={[styles.livePill, !showingLiveData && styles.simulatedPill]}>
+            <View style={[styles.liveDot, !showingLiveData && styles.simulatedDot]} />
+            <Text style={[styles.liveText, !showingLiveData && styles.simulatedText]}>
+              {showingLiveData ? 'Live GitHub data' : 'Simulated telemetry'}
+            </Text>
           </View>
         </View>
 
         <Text style={styles.subtitle}>
-          Turns EAS Update and mobile telemetry into rollout decisions a data team can trust.
+          Combines a mobile rollout model with live engineering signals from the open-source Expo repository.
         </Text>
 
-        <View style={styles.heroGrid}>
-          <MetricBlock label="Tracked sessions" value="145k" detail="+12.4k since deploy" />
-          <MetricBlock label="Risky release" value={selectedRelease.label} detail={selectedRelease.platform} />
-          <MetricBlock label="Action" value="Pause" detail="Android rollout" danger />
-        </View>
+        {!showingLiveData && (
+          <View style={styles.heroGrid}>
+            <MetricBlock label="Tracked sessions" value="145k" detail="Synthetic event sample" />
+            <MetricBlock label="Risky release" value={selectedRelease.label} detail={selectedRelease.platform} />
+            <MetricBlock label="Action" value="Pause" detail="Android rollout" danger />
+          </View>
+        )}
 
         <View style={styles.tabBar}>
           {tabs.map((tab) => {
@@ -214,6 +356,9 @@ export default function App() {
         {selectedTab === 'health' && <HealthView releaseScores={releaseScores} />}
         {selectedTab === 'anomalies' && <AnomalyView releaseScores={releaseScores} />}
         {selectedTab === 'pipeline' && <PipelineView selectedRelease={selectedRelease} />}
+        {selectedTab === 'oss' && (
+          <ExpoOssView state={expoOssState} onRefresh={() => setOssRefreshKey((key) => key + 1)} />
+        )}
       </ScrollView>
     </SafeAreaView>
   );
@@ -312,7 +457,7 @@ function AnomalyView({
     <View style={styles.section}>
       <View style={styles.sectionHeader}>
         <Text style={styles.sectionTitle}>Anomaly feed</Text>
-        <Text style={styles.sectionHint}>Explainable rules make the data product interviewable.</Text>
+        <Text style={styles.sectionHint}>Each alert includes the rule and evidence behind the recommendation.</Text>
       </View>
 
       {anomalies.map((anomaly) => (
@@ -382,6 +527,152 @@ function PipelineView({ selectedRelease }: { selectedRelease: Release }) {
   );
 }
 
+function ExpoOssView({ state, onRefresh }: { state: ExpoOssState; onRefresh: () => void }) {
+  if (state.loading && !state.data) {
+    return (
+      <View style={styles.loadingState}>
+        <ActivityIndicator color="#207a4c" size="large" />
+        <Text style={styles.loadingTitle}>Loading expo/expo signals</Text>
+        <Text style={styles.loadingText}>Reading repository, commit, and GitHub Actions data.</Text>
+      </View>
+    );
+  }
+
+  if (!state.data) {
+    return (
+      <View style={styles.errorState}>
+        <Text style={styles.errorTitle}>Live data is unavailable</Text>
+        <Text style={styles.errorText}>{state.error}</Text>
+        <Pressable onPress={onRefresh} style={styles.retryButton}>
+          <Text style={styles.retryButtonText}>Try again</Text>
+        </Pressable>
+      </View>
+    );
+  }
+
+  const { repository, workflowRuns, commits, fetchedAt } = state.data;
+  const completedRuns = workflowRuns.filter(
+    (run) => run.status === 'completed' && run.conclusion && run.conclusion !== 'skipped',
+  );
+  const successfulRuns = completedRuns.filter((run) => run.conclusion === 'success').length;
+  const successRate = completedRuns.length
+    ? `${Math.round((successfulRuns / completedRuns.length) * 100)}%`
+    : 'n/a';
+  const visibleRuns = workflowRuns.filter((run) => run.conclusion !== 'skipped').slice(0, 5);
+
+  return (
+    <View style={styles.section}>
+      <Pressable onPress={() => openExternalUrl(EXPO_REPOSITORY_URL)} style={styles.sourceBand}>
+        <View style={styles.sourceBandCopy}>
+          <Text style={styles.sourceLabel}>LIVE SOURCE</Text>
+          <Text style={styles.sourceTitle}>expo/expo</Text>
+          <Text style={styles.sourceDescription}>
+            Public GitHub API data. No token, private telemetry, or cached fixture.
+          </Text>
+        </View>
+        <Text style={styles.sourceLink}>Open repository</Text>
+      </Pressable>
+
+      <View style={styles.heroGrid}>
+        <MetricBlock
+          label="Stars"
+          value={formatCompactNumber(repository.stargazers_count)}
+          detail={`${formatCompactNumber(repository.forks_count)} forks`}
+        />
+        <MetricBlock
+          label="CI success"
+          value={successRate}
+          detail={`${completedRuns.length} recent completed runs`}
+        />
+        <MetricBlock
+          label="Repository push"
+          value={formatRelativeTime(repository.pushed_at)}
+          detail={`${formatNumber(repository.open_issues_count)} open issues + PRs`}
+        />
+      </View>
+
+      {state.error && (
+        <View style={styles.inlineWarning}>
+          <Text style={styles.inlineWarningText}>{state.error} Showing the last successful response.</Text>
+        </View>
+      )}
+
+      <View style={styles.subsectionHeader}>
+        <View>
+          <Text style={styles.sectionTitle}>Recent automation</Text>
+          <Text style={styles.sectionHint}>Latest non-skipped GitHub Actions runs.</Text>
+        </View>
+        <Pressable disabled={state.loading} onPress={onRefresh} style={styles.refreshButton}>
+          {state.loading ? (
+            <ActivityIndicator color="#183d62" size="small" />
+          ) : (
+            <Text style={styles.refreshButtonText}>Refresh</Text>
+          )}
+        </Pressable>
+      </View>
+
+      {visibleRuns.map((run) => {
+        const outcome = run.conclusion ?? run.status;
+        const successful = outcome === 'success';
+        const active = outcome === 'in_progress' || outcome === 'queued';
+        return (
+          <Pressable key={run.id} onPress={() => openExternalUrl(run.html_url)} style={styles.ossRow}>
+            <View style={styles.ossRowCopy}>
+              <Text numberOfLines={1} style={styles.ossRowTitle}>
+                {run.name}
+              </Text>
+              <Text numberOfLines={1} style={styles.ossRowMeta}>
+                {run.head_branch} | {formatRelativeTime(run.created_at)} |{' '}
+                {formatDuration(run.created_at, run.updated_at)}
+              </Text>
+            </View>
+            <View
+              style={[
+                styles.runStatus,
+                successful && styles.runStatusSuccess,
+                active && styles.runStatusActive,
+              ]}
+            >
+              <Text
+                style={[
+                  styles.runStatusText,
+                  successful && styles.runStatusTextSuccess,
+                  active && styles.runStatusTextActive,
+                ]}
+              >
+                {outcome.replace('_', ' ').toUpperCase()}
+              </Text>
+            </View>
+          </Pressable>
+        );
+      })}
+
+      <View style={styles.commitHeader}>
+        <Text style={styles.sectionTitle}>Latest commits</Text>
+        <Text style={styles.sectionHint}>Fresh activity on the default branch.</Text>
+      </View>
+
+      {commits.slice(0, 5).map((commit) => (
+        <Pressable
+          key={commit.sha}
+          onPress={() => openExternalUrl(commit.html_url)}
+          style={styles.commitRow}
+        >
+          <Text numberOfLines={2} style={styles.commitTitle}>
+            {commit.commit.message.split('\n')[0]}
+          </Text>
+          <Text style={styles.commitMeta}>
+            {commit.sha.slice(0, 7)} | {commit.author?.login ?? commit.commit.author.name} |{' '}
+            {formatRelativeTime(commit.commit.author.date)}
+          </Text>
+        </Pressable>
+      ))}
+
+      <Text style={styles.fetchedAt}>Fetched from GitHub {formatRelativeTime(fetchedAt)}</Text>
+    </View>
+  );
+}
+
 function Bar({
   label,
   value,
@@ -434,6 +725,7 @@ const styles = StyleSheet.create({
   header: {
     alignItems: 'flex-start',
     flexDirection: 'row',
+    flexWrap: 'wrap',
     justifyContent: 'space-between',
     gap: 16,
   },
@@ -469,6 +761,15 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '800',
   },
+  simulatedPill: {
+    backgroundColor: '#fff3d6',
+  },
+  simulatedDot: {
+    backgroundColor: '#b7791f',
+  },
+  simulatedText: {
+    color: '#7a4f08',
+  },
   subtitle: {
     color: '#40566d',
     fontSize: 16,
@@ -477,6 +778,7 @@ const styles = StyleSheet.create({
   },
   heroGrid: {
     flexDirection: Platform.OS === 'web' ? 'row' : 'column',
+    flexWrap: Platform.OS === 'web' ? 'wrap' : 'nowrap',
     gap: 10,
     marginTop: 20,
   },
@@ -486,6 +788,7 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     borderWidth: 1,
     flex: 1,
+    minWidth: Platform.OS === 'web' ? 210 : undefined,
     padding: 16,
   },
   metricLabel: {
@@ -789,5 +1092,205 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     lineHeight: 21,
     marginTop: 5,
+  },
+  loadingState: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    minHeight: 300,
+    padding: 24,
+  },
+  loadingTitle: {
+    color: '#101820',
+    fontSize: 18,
+    fontWeight: '800',
+    marginTop: 16,
+  },
+  loadingText: {
+    color: '#52708f',
+    fontSize: 14,
+    marginTop: 6,
+    textAlign: 'center',
+  },
+  errorState: {
+    alignItems: 'flex-start',
+    backgroundColor: '#fff1ef',
+    borderColor: '#efc6c1',
+    borderRadius: 8,
+    borderWidth: 1,
+    marginTop: 18,
+    padding: 18,
+  },
+  errorTitle: {
+    color: '#8f2f26',
+    fontSize: 17,
+    fontWeight: '900',
+  },
+  errorText: {
+    color: '#6d3b36',
+    fontSize: 14,
+    lineHeight: 20,
+    marginTop: 5,
+  },
+  retryButton: {
+    backgroundColor: '#8f2f26',
+    borderRadius: 6,
+    marginTop: 14,
+    paddingHorizontal: 14,
+    paddingVertical: 9,
+  },
+  retryButtonText: {
+    color: '#ffffff',
+    fontSize: 13,
+    fontWeight: '800',
+  },
+  sourceBand: {
+    alignItems: Platform.OS === 'web' ? 'center' : 'flex-start',
+    backgroundColor: '#eaf4ff',
+    borderColor: '#bfd8f0',
+    borderRadius: 8,
+    borderWidth: 1,
+    flexDirection: Platform.OS === 'web' ? 'row' : 'column',
+    flexWrap: 'wrap',
+    gap: 14,
+    justifyContent: 'space-between',
+    padding: 16,
+  },
+  sourceBandCopy: {
+    flex: 1,
+  },
+  sourceLabel: {
+    color: '#31638f',
+    fontSize: 11,
+    fontWeight: '900',
+  },
+  sourceTitle: {
+    color: '#101820',
+    fontSize: 22,
+    fontWeight: '900',
+    marginTop: 3,
+  },
+  sourceDescription: {
+    color: '#40566d',
+    fontSize: 13,
+    lineHeight: 19,
+    marginTop: 4,
+  },
+  sourceLink: {
+    color: '#185f9c',
+    fontSize: 13,
+    fontWeight: '900',
+  },
+  inlineWarning: {
+    backgroundColor: '#fff8eb',
+    borderColor: '#f3d9a6',
+    borderRadius: 8,
+    borderWidth: 1,
+    marginTop: 12,
+    padding: 12,
+  },
+  inlineWarningText: {
+    color: '#6a4a15',
+    fontSize: 13,
+    lineHeight: 18,
+  },
+  subsectionHeader: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 12,
+    justifyContent: 'space-between',
+    marginBottom: 12,
+    marginTop: 24,
+  },
+  refreshButton: {
+    alignItems: 'center',
+    borderColor: '#a9bfd4',
+    borderRadius: 6,
+    borderWidth: 1,
+    justifyContent: 'center',
+    minHeight: 36,
+    minWidth: 74,
+    paddingHorizontal: 11,
+  },
+  refreshButtonText: {
+    color: '#183d62',
+    fontSize: 12,
+    fontWeight: '900',
+  },
+  ossRow: {
+    alignItems: 'center',
+    backgroundColor: '#ffffff',
+    borderColor: '#dde7f1',
+    borderRadius: 8,
+    borderWidth: 1,
+    flexDirection: 'row',
+    gap: 12,
+    justifyContent: 'space-between',
+    marginBottom: 9,
+    minHeight: 66,
+    padding: 13,
+  },
+  ossRowCopy: {
+    flex: 1,
+    minWidth: 0,
+  },
+  ossRowTitle: {
+    color: '#101820',
+    fontSize: 14,
+    fontWeight: '800',
+  },
+  ossRowMeta: {
+    color: '#6f8296',
+    fontSize: 12,
+    marginTop: 5,
+  },
+  runStatus: {
+    backgroundColor: '#fff1ef',
+    borderRadius: 999,
+    paddingHorizontal: 9,
+    paddingVertical: 6,
+  },
+  runStatusSuccess: {
+    backgroundColor: '#e7f5ed',
+  },
+  runStatusActive: {
+    backgroundColor: '#eaf4ff',
+  },
+  runStatusText: {
+    color: '#a1362c',
+    fontSize: 10,
+    fontWeight: '900',
+  },
+  runStatusTextSuccess: {
+    color: '#207a4c',
+  },
+  runStatusTextActive: {
+    color: '#185f9c',
+  },
+  commitHeader: {
+    marginBottom: 12,
+    marginTop: 24,
+  },
+  commitRow: {
+    borderBottomColor: '#d9e3ec',
+    borderBottomWidth: 1,
+    paddingHorizontal: 2,
+    paddingVertical: 12,
+  },
+  commitTitle: {
+    color: '#101820',
+    fontSize: 14,
+    fontWeight: '800',
+    lineHeight: 20,
+  },
+  commitMeta: {
+    color: '#6f8296',
+    fontSize: 12,
+    marginTop: 5,
+  },
+  fetchedAt: {
+    color: '#6f8296',
+    fontSize: 12,
+    marginTop: 14,
+    textAlign: 'right',
   },
 });
